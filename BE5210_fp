@@ -1,0 +1,239 @@
+import os
+
+from google.colab import drive
+Drive = drive.mount('/content/drive')
+
+print("Connected")
+
+import numpy as np
+import scipy.io
+from scipy import signal, interpolate
+from tqdm import tqdm
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import TimeSeriesSplit
+
+# ========== Parameters ==========
+fs = 1000                      # Sampling frequency (Hz)
+window_len = 200               # Window length increased to 200ms
+overlap = 100                  # 50% overlap (100ms)
+step = window_len - overlap    # Step size between windows
+N_wind = 6                     # Number of historical windows (300ms context)
+delay_steps = 2                # 100ms delay compensation (2 steps × 50ms/step)
+
+# ========== Filtering Function ==========
+def filter_data(raw_eeg, fs=1000):
+    """Bandpass filter (1-180Hz) using FIR filter"""
+    b = signal.firwin(101, [1, 180], pass_zero='bandpass', fs=fs)
+    return signal.lfilter(b, [1.0], raw_eeg, axis=0)
+
+# ========== Enhanced Feature Extraction ==========
+def get_features(filtered_window, fs=1000):
+    """Extract time-domain and frequency-domain features"""
+    num_samples, num_channels = filtered_window.shape
+
+    # Time-domain features
+    time_feats = np.array([
+        np.var(filtered_window, axis=0),                      # Variance
+        ((filtered_window[:-1] * filtered_window[1:]) < 0).sum(axis=0) / num_samples  # Zero-crossing rate
+    ])
+
+    # Frequency-domain features (focus on motor-related bands)
+    freq_bands = [(13, 30), (70, 200)]  # β and γ bands
+    freqs = np.fft.rfftfreq(num_samples, d=1/fs)
+    fft_vals = np.abs(np.fft.rfft(filtered_window, axis=0))
+
+    features = []
+    for ch in range(num_channels):
+        # Band energy calculations with empty band check
+        band_energy = [np.mean(fft_vals[(freqs >= low) & (freqs < high), ch]) 
+                      if np.any((freqs >= low) & (freqs < high)) else 0
+                      for low, high in freq_bands]
+        
+        features.append(np.concatenate([
+            time_feats[:, ch],
+            band_energy,
+            [band_energy[1] / (band_energy[0] + 1e-10)]  # γ/β ratio
+        ]))
+
+    return np.array(features)
+
+# ========== Time-Delayed R Matrix Construction ==========
+def create_R_matrix(features, N_wind, delay=0):
+    """Create design matrix with delay compensation"""
+    padded = np.vstack([np.tile(features[0], (N_wind + delay - 1, 1)), features])
+    R = np.zeros((len(features), 1 + N_wind * features.shape[1]))
+    for i in range(len(features)):
+        window_feats = padded[i + delay : i + delay + N_wind].flatten()
+        R[i] = np.concatenate(([1], window_feats))  # Add bias term
+    return R
+
+# ========== Downsampling & Interpolation ==========
+def downsample_glove(glove, window_len, overlap):
+    """Downsample glove data to match feature rate"""
+    return np.array([
+        np.mean(glove[i*step : i*step + window_len], axis=0)
+        for i in range((len(glove) - overlap) // step)
+    ])
+
+def interpolate_prediction(pred, original_len, step):
+    """Upsample predictions from 50Hz to 1000Hz"""
+    x_old = np.arange(pred.shape[0]) * step
+    x_new = np.arange(original_len)
+    return np.column_stack([
+        interpolate.CubicSpline(x_old, pred[:, i])(x_new)
+        for i in range(pred.shape[1])
+    ])
+
+# ========== Sliding Window Features ==========
+'''
+def get_windowed_feats(raw_ecog, fs, window_length, window_overlap, disable_tqdm=False):
+    num_samples, num_channels = raw_ecog.shape
+    step = window_length - window_overlap
+    num_windows = (num_samples - window_overlap) // step
+    all_feats = []
+    for i in tqdm(range(num_windows), desc="Extracting features", disable=disable_tqdm):
+        start = i * step
+        end = start + window_length
+        if end > num_samples:
+            break
+        window = raw_ecog[start:end, :]
+        filtered = filter_data(window, fs=fs)
+        feats = get_features(filtered, fs=fs)
+        all_feats.append(feats.flatten())
+    return np.array(all_feats)
+'''
+def get_windowed_feats(raw_ecog, fs, window_length, window_overlap, disable_tqdm=False):
+    num_samples, num_channels = raw_ecog.shape
+    step = window_length - window_overlap
+    num_windows = (num_samples - window_overlap) // step
+    all_feats = []
+    for i in tqdm(range(num_windows), desc="Extracting features", disable=disable_tqdm):
+        start = i * step
+        end = start + window_length
+        if end > num_samples:
+            break
+        window = raw_ecog[start:end, :]
+        filtered = filter_data(window, fs=fs)
+        feats = get_features(filtered, fs=fs)
+        all_feats.append(feats.flatten())
+    return np.array(all_feats)
+
+
+# ========== Performance Evaluation ==========
+def calculate_r2(true, pred):
+    """Calculate R² score for each finger"""
+    ss_res = np.sum((true - pred)**2, axis=0)
+    ss_tot = np.sum((true - np.mean(true, axis=0))**2, axis=0)
+    return 1 - (ss_res / (ss_tot + 1e-10))  # Avoid division by zero
+
+# ========== Main Processing Pipeline ==========
+
+def run_subject(ecog_train, glove_train, ecog_test=None, show_progress=False):
+    """Complete processing pipeline for one subject"""
+    # Feature extraction with optional progress bar
+    with tqdm(total=3, desc="Processing", disable=not show_progress) as pbar:
+        feats_train = get_windowed_feats(ecog_train, fs, window_len, overlap, disable_tqdm=True)
+        pbar.update(1)
+        
+        feats_train = StandardScaler().fit_transform(feats_train)
+        pbar.update(1)
+        
+        R_train = create_R_matrix(feats_train, N_wind, delay_steps)
+        glove_down = downsample_glove(glove_train, window_len, overlap)
+        pbar.update(1)
+
+    # Ridge regression training and CV
+    model = Ridge(alpha=1.0).fit(R_train, glove_down)
+
+    tscv = TimeSeriesSplit(n_splits=3)
+    val_r2 = []
+    for train_idx, val_idx in tscv.split(R_train):
+        val_r2.append(calculate_r2(
+            glove_down[val_idx],
+            model.predict(R_train[val_idx])
+        ))
+
+    if ecog_test is not None:
+        feats_test = get_windowed_feats(ecog_test, fs, window_len, overlap, disable_tqdm=True)
+        feats_test = StandardScaler().fit_transform(feats_test)
+        R_test = create_R_matrix(feats_test, N_wind, delay_steps)
+        pred_50hz = model.predict(R_test)
+        pred_1000hz = interpolate_prediction(pred_50hz, ecog_test.shape[0], step)
+        return pred_1000hz, np.mean(val_r2)
+
+    return None, np.mean(val_r2)
+'''
+def run_subject(ecog_train, glove_train, ecog_test=None):
+    """Complete processing pipeline for one subject"""
+    # Feature extraction with progress bar
+    with tqdm(total=3, desc="Processing") as pbar:
+        feats_train = get_windowed_feats(ecog_train, fs, window_len, overlap)
+        pbar.update(1)
+        
+        # Feature standardization
+        feats_train = StandardScaler().fit_transform(feats_train)
+        pbar.update(1)
+        
+        # Create design matrix with delay compensation
+        R_train = create_R_matrix(feats_train, N_wind, delay_steps)
+        glove_down = downsample_glove(glove_train, window_len, overlap)
+        pbar.update(1)
+
+    # Ridge regression model training
+    model = Ridge(alpha=1.0).fit(R_train, glove_down)
+    
+    # Time-series cross-validation
+    tscv = TimeSeriesSplit(n_splits=3)
+    val_r2 = []
+    for train_idx, val_idx in tscv.split(R_train):
+        val_r2.append(calculate_r2(
+            glove_down[val_idx],
+            model.predict(R_train[val_idx])
+        ))
+    
+    # Test set prediction
+    if ecog_test is not None:
+        feats_test = get_windowed_feats(ecog_test, fs, window_len, overlap)
+        feats_test = StandardScaler().fit_transform(feats_test)
+        R_test = create_R_matrix(feats_test, N_wind, delay_steps)
+        pred_50hz = model.predict(R_test)
+        pred_1000hz = interpolate_prediction(pred_50hz, ecog_test.shape[0], step)
+        return pred_1000hz, np.mean(val_r2)
+    
+    return None, np.mean(val_r2)
+'''
+# ========== Main Execution ==========
+if __name__ == "__main__":
+    # Load data
+    train_data = scipy.io.loadmat('/content/drive/MyDrive/raw_training_data.mat')
+    test_data = scipy.io.loadmat('/content/drive/MyDrive/leaderboard_data.mat')
+    train_ecogs = train_data['train_ecog']
+    train_gloves = train_data['train_dg']
+    leaderboard_ecogs = test_data['leaderboard_ecog']
+
+   # Process each subject
+    all_preds, all_r2 = {}, []
+    with tqdm(total=3, desc="Processing Subjects", bar_format='{l_bar}{bar:30}{r_bar}', dynamic_ncols=True) as progress_bar:
+        for subj in range(3):
+            print(f"\n=== Processing Subject {subj+1} ===")
+            pred, r2 = run_subject(
+                train_ecogs[subj].item(),
+                train_gloves[subj].item(),
+                leaderboard_ecogs[subj].item(),
+                show_progress=False  
+            )
+            all_preds[f'subj_{subj+1}'] = pred
+            all_r2.append(r2)
+            print(f"Validation R²: {r2:.3f}")
+            progress_bar.update(1)
+
+
+    # Save results in submission format
+    predicted_dg = np.empty((3, 1), dtype=object)
+    for i in range(3):
+        predicted_dg[i, 0] = all_preds[f'subj_{i+1}']
+    scipy.io.savemat('improved_prediction.mat', {'predicted_dg': predicted_dg})
+
+    print(f"\nAverage R² across subjects: {np.mean(all_r2):.3f}")
+    print("✅ Results saved to improved_prediction.mat")
