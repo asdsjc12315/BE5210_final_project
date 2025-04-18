@@ -1,0 +1,171 @@
+import numpy as np
+import scipy.io
+from scipy import signal, interpolate, linalg
+from tqdm import tqdm
+from sklearn.preprocessing import StandardScaler
+
+# ========== Parameter Configuration ==========
+fs = 1000
+window_len = 100  # 100ms window
+overlap = 50      # 50ms overlap
+step = window_len - overlap
+delay_steps = 3   # 150ms delay (3 windows)
+
+# Strictly defined frequency bands
+freq_bands = [
+    (5, 15),     # Band 1
+    (20, 25),    # Band 2
+    (75, 115),   # Band 3
+    (125, 160),  # Band 4
+    (160, 175)   # Band 5
+]
+
+# ========== Feature Extraction ==========
+def extract_features(window, fs=1000):
+    """Strictly extract 6 features per channel (1 time domain + 5 frequency bands)"""
+    num_channels = window.shape[1]
+    
+    # 1. Time-domain feature: Mean voltage
+    time_feat = np.mean(window, axis=0)  # [num_channels]
+    
+    # 2. Frequency-domain features: Energy in 5 bands
+    freqs = np.fft.rfftfreq(len(window), d=1/fs)
+    fft_vals = np.abs(np.fft.rfft(window, axis=0))
+    
+    freq_feats = []
+    for low, high in freq_bands:
+        mask = (freqs >= low) & (freqs < high)
+        if np.any(mask):
+            band_energy = np.mean(fft_vals[mask], axis=0)  # [num_channels]
+        else:
+            band_energy = np.zeros(num_channels)
+        freq_feats.append(band_energy)
+    
+    # Combine features: [num_channels × 6]
+    return np.column_stack([time_feat] + freq_feats)
+
+def get_windowed_features(raw_ecog, fs, window_len, overlap):
+    """Sliding window feature extraction"""
+    num_samples, num_channels = raw_ecog.shape
+    step = window_len - overlap
+    num_windows = (num_samples - overlap) // step
+    
+    features = []
+    for i in range(num_windows):
+        window = raw_ecog[i*step : i*step + window_len]
+        feat = extract_features(window, fs=fs)
+        features.append(feat.flatten())  # Flatten to [num_channels * 6]
+    
+    return np.array(features)
+
+# ========== Linear Regression Implementation ==========
+def linear_regression_predict(X_train, y_train, X_test):
+    """Strict implementation of linear regression"""
+    # Add bias term
+    X_train = np.hstack([np.ones((X_train.shape[0], 1)), X_train])
+    X_test = np.hstack([np.ones((X_test.shape[0], 1)), X_test])
+    
+    # Compute regression coefficients: β = (X^T X)^-1 X^T Y
+    XtX = X_train.T @ X_train
+    XtY = X_train.T @ y_train
+    beta = linalg.pinv(XtX) @ XtY  # Use pseudo-inverse for numerical stability
+    
+    # Prediction
+    return X_test @ beta
+
+# ========== Data Preprocessing ==========
+def downsample_glove(glove, window_len, overlap):
+    """Downsample glove data to 50ms intervals"""
+    step = window_len - overlap
+    return np.array([
+        np.mean(glove[i*step : i*step + window_len], axis=0)
+        for i in range((len(glove) - overlap) // step)
+    ])
+
+def create_sequential_data(features, delay_steps):
+    """Create sequential data with delay"""
+    seq_data = []
+    for i in range(delay_steps, len(features)):
+        seq = features[i-delay_steps:i].flatten()  # Concatenate 3 windows
+        seq_data.append(seq)
+    return np.array(seq_data)
+
+def interpolate_predictions(pred, original_len, step):
+    """Cubic spline interpolation back to 1000Hz"""
+    x_old = np.arange(pred.shape[0]) * step
+    x_new = np.arange(original_len)
+    
+    # Edge case handling
+    if len(x_old) == 1:  # Special case
+        return np.tile(pred, (original_len, 1))
+    
+    # Interpolation with boundary constraints
+    return np.column_stack([
+        interpolate.CubicSpline(
+            x_old, 
+            pred[:, i],
+            bc_type=((1, 0), (1, 0))  # First derivative = 0 at boundaries
+        )(x_new)
+        for i in range(pred.shape[1])
+    ])
+
+# ========== Main Workflow ==========
+if __name__ == "__main__":
+    # Load data
+    train_data = scipy.io.loadmat('/content/drive/MyDrive/raw_training_data.mat')
+    test_data = scipy.io.loadmat('/content/drive/MyDrive/leaderboard_data.mat')
+    train_ecogs = [train_data['train_ecog'][i].item() for i in range(3)]
+    train_gloves = [train_data['train_dg'][i].item() for i in range(3)]
+    test_ecogs = [test_data['leaderboard_ecog'][i].item() for i in range(3)]
+    
+    # Process each subject
+    all_preds = []
+    for subj in range(3):
+        print(f"\n=== Processing Subject {subj+1} ===")
+        
+        # Feature extraction
+        ecog_train = train_ecogs[subj]
+        feats_train = get_windowed_features(ecog_train, fs, window_len, overlap)
+        
+        # Downsample glove data
+        glove_train = train_gloves[subj]
+        glove_down = downsample_glove(glove_train, window_len, overlap)
+        
+        # Create sequential dataset (150ms delay)
+        X_train = create_sequential_data(feats_train, delay_steps)
+        y_train = glove_down[delay_steps:]  # Align targets
+        
+        # Standardization
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        
+        # Train linear regression
+        print("Training linear regression model...")
+        beta = linear_regression_predict(X_train_scaled, y_train, X_train_scaled)
+        
+        # Validate on training set
+        train_pred = linear_regression_predict(X_train_scaled, y_train, X_train_scaled)
+        r2 = 1 - np.sum((y_train - train_pred)**2) / np.sum((y_train - np.mean(y_train))**2)
+        print(f"Training set R²: {r2:.4f}")
+        
+        # Predict on test set
+        ecog_test = test_ecogs[subj]
+        feats_test = get_windowed_features(ecog_test, fs, window_len, overlap)
+        X_test = create_sequential_data(feats_test, delay_steps)
+        X_test_scaled = scaler.transform(X_test)
+        
+        print("Predicting on test set...")
+        pred_50hz = linear_regression_predict(X_train_scaled, y_train, X_test_scaled)
+        pred_1000hz = interpolate_predictions(pred_50hz, len(ecog_test), step)
+        all_preds.append(pred_1000hz)
+    
+    # Save results
+    predicted_dg = np.empty((3,1), dtype=object)
+    for i in range(3):
+        predicted_dg[i,0] = all_preds[i]
+    scipy.io.savemat('linear_prediction.mat', {'predicted_dg': predicted_dg})
+    print("\n✅ Prediction results saved to linear_prediction.mat")
+
+    # Optional: Transformer implementation available
+    print("\nOptional: Want to replace linear regression with a Transformer model?")
+    print("Just replace linear_regression_predict with the Transformer model.")
