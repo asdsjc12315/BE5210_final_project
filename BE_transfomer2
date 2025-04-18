@@ -1,0 +1,270 @@
+import math
+import numpy as np
+import scipy.io
+from scipy import signal, interpolate, stats
+from tqdm import tqdm
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.decomposition import PCA
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.cuda.amp import GradScaler, autocast
+
+# ========== Enhanced Parameters ==========
+fs = 1000
+window_len = 100  # 100ms window
+overlap = 50      # 50ms overlap
+step = window_len - overlap
+delay_steps = 3   # 150ms lag (3 windows)
+
+# Extended frequency bands with more granularity
+freq_bands = [
+    (5, 10), (10, 15),    # Theta/Alpha ranges
+    (20, 25), (25, 30),   # Beta ranges
+    (75, 100), (100, 125), # Low gamma
+    (125, 140), (140, 160), # High gamma
+    (160, 175)            # Very high gamma
+]
+
+# ========== Enhanced Transformer Model ==========
+class EnhancedECoGTransformer(nn.Module):
+    def __init__(self, input_dim, output_dim=5, d_model=256, nhead=8, num_layers=4):
+        super().__init__()
+        
+        # Enhanced embedding with residual connection
+        self.embedding = nn.Sequential(
+            nn.Linear(input_dim, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(0.2)
+        )
+        
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(d_model, dropout=0.1)
+        
+        # Transformer layers with increased capacity
+        encoder_layers = TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=1024,  # Increased hidden size
+            dropout=0.2,
+            batch_first=True,
+            activation='gelu'
+        )
+        self.transformer = TransformerEncoder(encoder_layers, num_layers)
+        
+        # Multi-scale feature extraction
+        self.temporal_conv = nn.Sequential(
+            nn.Conv1d(d_model, d_model//2, kernel_size=3, padding=1),
+            nn.BatchNorm1d(d_model//2),
+            nn.GELU(),
+            nn.Conv1d(d_model//2, d_model//4, kernel_size=3, padding=1),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten()
+        )
+        
+        # Enhanced output head
+        self.head = nn.Sequential(
+            nn.Linear(d_model + d_model//4, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.Linear(128, output_dim)
+        )
+        
+    def forward(self, x):
+        # Embedding
+        x = self.embedding(x)  # [batch, seq_len, d_model]
+        x = self.pos_encoder(x)
+        
+        # Transformer processing
+        trans_out = self.transformer(x)
+        
+        # Temporal convolution
+        conv_out = self.temporal_conv(trans_out.permute(0, 2, 1))
+        
+        # Combine features
+        trans_pool = trans_out.mean(dim=1)  # Global average pooling
+        combined = torch.cat([trans_pool, conv_out], dim=1)
+        
+        return self.head(combined)
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:x.size(1)].transpose(0, 1)
+        return self.dropout(x)
+
+# ========== Enhanced Feature Extraction ==========
+def extract_window_features(window, fs=1000):
+    """Enhanced feature extraction with more temporal and spectral features"""
+    num_samples, num_channels = window.shape
+    
+    # Time-domain features
+    time_feats = np.column_stack([
+        np.mean(window, axis=0),      # Mean voltage
+        np.median(window, axis=0),    # Median voltage
+        np.std(window, axis=0),       # Standard deviation
+        stats.skew(window, axis=0),   # Skewness
+        stats.kurtosis(window, axis=0), # Kurtosis
+        ((window[:-1] * window[1:]) < 0).sum(axis=0) / num_samples  # Zero-crossing rate
+    ])
+    
+    # Frequency-domain features
+    freqs = np.fft.rfftfreq(num_samples, d=1/fs)
+    fft_vals = np.abs(np.fft.rfft(window, axis=0))
+    
+    freq_feats = []
+    for low, high in freq_bands:
+        mask = (freqs >= low) & (freqs < high)
+        if np.any(mask):
+            band_energy = np.mean(fft_vals[mask], axis=0)
+            band_entropy = stats.entropy(fft_vals[mask]+1e-10, axis=0)  # Spectral entropy
+        else:
+            band_energy = np.zeros(num_channels)
+            band_entropy = np.zeros(num_channels)
+        freq_feats.extend([band_energy, band_entropy])
+    
+    # Cross-channel features
+    corr_matrix = np.corrcoef(window.T)
+    cross_feats = corr_matrix[np.triu_indices(num_channels, k=1)]
+    
+    # Combine all features
+    return np.concatenate([
+        time_feats.flatten(),
+        np.array(freq_feats).flatten(),
+        cross_feats.flatten()
+    ])
+
+# ========== Enhanced Training Pipeline ==========
+def train_enhanced_model(X_train, y_train, device):
+    """Enhanced training with mixed precision and better optimization"""
+    # Data augmentation - add slight noise
+    X_noised = X_train + np.random.normal(0, 0.01, X_train.shape)
+    X_train = np.concatenate([X_train, X_noised])
+    y_train = np.concatenate([y_train, y_train])
+    
+    # Convert to PyTorch tensors
+    train_x = torch.FloatTensor(X_train).to(device)
+    train_y = torch.FloatTensor(y_train).to(device)
+    dataset = TensorDataset(train_x, train_y)
+    
+    # Initialize enhanced model
+    input_dim = X_train.shape[-1]
+    model = EnhancedECoGTransformer(input_dim=input_dim).to(device)
+    
+    # Enhanced optimizer and scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+    scheduler = CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-6)
+    criterion = nn.MSELoss()
+    scaler = GradScaler()
+    
+    # Early stopping
+    best_loss = float('inf')
+    patience = 10
+    patience_counter = 0
+    
+    # Training loop with mixed precision
+    train_loader = DataLoader(dataset, batch_size=128, shuffle=True)
+    for epoch in tqdm(range(150), desc="Enhanced Training"):
+        model.train()
+        epoch_loss = 0
+        
+        for x, y in train_loader:
+            optimizer.zero_grad()
+            
+            with autocast():
+                outputs = model(x)
+                loss = criterion(outputs, y)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            epoch_loss += loss.item()
+        
+        scheduler.step()
+        
+        # Early stopping check
+        if epoch_loss < best_loss:
+            best_loss = epoch_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), 'best_enhanced_model.pth')
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch}")
+                break
+    
+    return model
+
+# ========== Main Execution ==========
+if __name__ == "__main__":
+    # Load data with enhanced preprocessing
+    train_data = scipy.io.loadmat('/content/drive/MyDrive/raw_training_data.mat')
+    test_data = scipy.io.loadmat('/content/drive/MyDrive/leaderboard_data.mat')
+    
+    # Process each subject with enhanced pipeline
+    all_preds = []
+    for subj in range(3):
+        print(f"\n=== Processing Subject {subj+1} with Enhanced Pipeline ===")
+        
+        # Enhanced feature extraction
+        ecog_data = train_data['train_ecog'][subj].item()
+        feats = get_windowed_features(ecog_data, fs, window_len, overlap)
+        
+        # Advanced feature scaling
+        scaler = RobustScaler(quantile_range=(5, 95))  # More robust to outliers
+        feats = scaler.fit_transform(feats)
+        
+        # Optional: Dimensionality reduction
+        pca = PCA(n_components=0.95)  # Keep 95% variance
+        feats = pca.fit_transform(feats)
+        
+        # Create sequential dataset
+        X_seq = create_sequential_dataset(feats, delay_steps)
+        glove_data = train_data['train_dg'][subj].item()
+        glove_down = downsample_glove(glove_data, window_len, overlap)
+        y_train = glove_down[delay_steps:]
+        
+        # Train enhanced model
+        model = train_enhanced_model(X_seq, y_train, device)
+        
+        # Test prediction with ensemble
+        test_ecog = test_data['leaderboard_ecog'][subj].item()
+        test_feats = get_windowed_features(test_ecog, fs, window_len, overlap)
+        test_feats = scaler.transform(test_feats)
+        if 'pca' in locals():
+            test_feats = pca.transform(test_feats)
+        X_test_seq = create_sequential_dataset(test_feats, delay_steps)
+        
+        # Multiple predictions for stability
+        preds = []
+        for _ in range(3):  # Small ensemble
+            with torch.no_grad():
+                pred = model(torch.FloatTensor(X_test_seq).to(device)).cpu().numpy()
+            preds.append(pred)
+        
+        # Average predictions
+        pred_50hz = np.mean(preds, axis=0)
+        pred_1000hz = interpolate_prediction(pred_50hz, len(test_ecog), step)
+        all_preds.append(pred_1000hz)
+    
+    # Save enhanced predictions
+    predicted_dg = np.empty((3,1), dtype=object)
+    for i in range(3):
+        predicted_dg[i,0] = all_preds[i]
+    scipy.io.savemat('enhanced_transformer_prediction.mat', {'predicted_dg': predicted_dg})
+    print("\n✅ Enhanced predictions saved to enhanced_transformer_prediction.mat")
